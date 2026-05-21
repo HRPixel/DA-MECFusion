@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_debug", type=str2bool, default=False)
+    parser.add_argument("--save_debug", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--save_dir", type=str, default="debug_outputs/priors")
     return parser.parse_args()
 

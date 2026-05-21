@@ -34,8 +34,10 @@ class MECModule(nn.Module):
         self.weight_predictor = nn.Sequential(
             *self._conv_block(in_channels, hidden_channels, kernel_size=3, use_bn=use_bn),
             *self._conv_block(hidden_channels, hidden_channels, kernel_size=3, use_bn=use_bn),
-            nn.Conv2d(hidden_channels, 2, kernel_size=1),
         )
+        self.logit_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+        nn.init.zeros_(self.logit_conv.weight)
+        nn.init.zeros_(self.logit_conv.bias)
 
     @staticmethod
     def _conv_block(
@@ -92,7 +94,7 @@ class MECModule(nn.Module):
             [feat_ir, feat_vis, thermal_prior, sat_uncertainty, smoke_prior],
             dim=1,
         )
-        logits = self.weight_predictor(z)
+        logits = self.logit_conv(self.weight_predictor(z))
         weights = torch.softmax(logits, dim=1)
         w_ir = weights[:, 0:1]
         w_vis = weights[:, 1:2]
@@ -120,11 +122,15 @@ if __name__ == "__main__":
     _print_tensor_stats("fused_feat", fused_feat)
     _print_tensor_stats("w_ir", w_ir)
     _print_tensor_stats("w_vis", w_vis)
+    print(f"w_ir mean: {w_ir.mean().item():.6f}")
+    print(f"w_vis mean: {w_vis.mean().item():.6f}")
 
     assert fused_feat.shape == (2, 64, 128, 128), fused_feat.shape
     assert w_ir.shape == (2, 1, 128, 128), w_ir.shape
     assert w_vis.shape == (2, 1, 128, 128), w_vis.shape
     assert torch.max(torch.abs(w_ir + w_vis - 1.0)).item() < 1e-5
+    assert abs(w_ir.mean().item() - 0.5) < 1e-5
+    assert abs(w_vis.mean().item() - 0.5) < 1e-5
 
     loss = fused_feat.mean()
     loss.backward()

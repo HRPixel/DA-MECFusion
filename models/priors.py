@@ -40,11 +40,13 @@ def mean_filter(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
     if kernel_size <= 0 or kernel_size % 2 == 0:
         raise ValueError("kernel_size must be a positive odd integer")
 
+    pad = kernel_size // 2
+    x_pad = F.pad(x, (pad, pad, pad, pad), mode="reflect")
     return F.avg_pool2d(
-        x,
+        x_pad,
         kernel_size=kernel_size,
         stride=1,
-        padding=kernel_size // 2,
+        padding=0,
     )
 
 
@@ -60,8 +62,9 @@ def sobel_gradient(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
     ).view(1, 1, 3, 3)
 
-    gx = F.conv2d(x, kx, padding=1)
-    gy = F.conv2d(x, ky, padding=1)
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    gx = F.conv2d(x_pad, kx, padding=0)
+    gy = F.conv2d(x_pad, ky, padding=0)
     return torch.sqrt(gx * gx + gy * gy + eps)
 
 
@@ -91,6 +94,7 @@ class ThermalSaliencyPrior(nn.Module):
         window_size: int = 7,
         eps: float = 1e-6,
         smooth: bool = True,
+        use_minmax_norm: bool = False,
     ) -> None:
         super().__init__()
         self.p_low = p_low
@@ -102,6 +106,7 @@ class ThermalSaliencyPrior(nn.Module):
         self.window_size = window_size
         self.eps = eps
         self.smooth = smooth
+        self.use_minmax_norm = use_minmax_norm
 
     def forward(self, ir: torch.Tensor) -> torch.Tensor:
         if ir.dim() != 4 or ir.size(1) != 1:
@@ -123,9 +128,13 @@ class ThermalSaliencyPrior(nn.Module):
         c_ir = (ir_norm - local_mean) / (local_std + self.eps)
         s_l = torch.sigmoid(c_ir / self.gamma_l)
 
-        s_thermal = normalize_0_1(self.alpha * s_g + (1.0 - self.alpha) * s_l, self.eps)
+        s_thermal = self.alpha * s_g + (1.0 - self.alpha) * s_l
         if self.smooth:
-            s_thermal = normalize_0_1(mean_filter(s_thermal, 3), self.eps)
+            s_thermal = mean_filter(s_thermal, 3)
+        if self.use_minmax_norm:
+            s_thermal = normalize_0_1(s_thermal, eps=self.eps)
+        else:
+            s_thermal = torch.clamp(s_thermal, 0.0, 1.0)
         return s_thermal
 
 
@@ -139,6 +148,7 @@ class VisibleSaturationUncertainty(nn.Module):
         eps: float = 1e-6,
         smooth: bool = True,
         use_white_consistency: bool = False,
+        use_minmax_norm: bool = False,
     ) -> None:
         super().__init__()
         self.sat_threshold = sat_threshold
@@ -146,6 +156,7 @@ class VisibleSaturationUncertainty(nn.Module):
         self.eps = eps
         self.smooth = smooth
         self.use_white_consistency = use_white_consistency
+        self.use_minmax_norm = use_minmax_norm
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         if vis.dim() != 4 or vis.size(1) != 3:
@@ -163,10 +174,14 @@ class VisibleSaturationUncertainty(nn.Module):
         grad = sobel_gradient(vis_y, self.eps)
         grad_norm = normalize_0_1(grad, self.eps)
         texture_loss = 1.0 - grad_norm
-        u_sat = normalize_0_1(sat_response * texture_loss, self.eps)
+        u_sat = sat_response * texture_loss
 
         if self.smooth:
-            u_sat = normalize_0_1(mean_filter(u_sat, 3), self.eps)
+            u_sat = mean_filter(u_sat, 3)
+        if self.use_minmax_norm:
+            u_sat = normalize_0_1(u_sat, eps=self.eps)
+        else:
+            u_sat = torch.clamp(u_sat, 0.0, 1.0)
         return u_sat
 
 
@@ -183,6 +198,7 @@ class SmokeLowContrastPrior(nn.Module):
         use_sigmoid: bool = False,
         tau_d: float = 0.4,
         gamma_d: float = 0.1,
+        use_minmax_norm: bool = False,
     ) -> None:
         super().__init__()
         self.window_size = window_size
@@ -193,6 +209,7 @@ class SmokeLowContrastPrior(nn.Module):
         self.use_sigmoid = use_sigmoid
         self.tau_d = tau_d
         self.gamma_d = gamma_d
+        self.use_minmax_norm = use_minmax_norm
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         if vis.dim() != 4 or vis.size(1) != 3:
@@ -215,7 +232,11 @@ class SmokeLowContrastPrior(nn.Module):
 
         if self.smooth:
             d_smoke = mean_filter(d_smoke, 3)
-        return normalize_0_1(d_smoke, self.eps)
+        if self.use_minmax_norm:
+            d_smoke = normalize_0_1(d_smoke, eps=self.eps)
+        else:
+            d_smoke = torch.clamp(d_smoke, 0.0, 1.0)
+        return d_smoke
 
 
 class RuleBasedPriorModule(nn.Module):
@@ -226,11 +247,19 @@ class RuleBasedPriorModule(nn.Module):
         thermal_prior: ThermalSaliencyPrior | None = None,
         saturation_uncertainty: VisibleSaturationUncertainty | None = None,
         smoke_prior: SmokeLowContrastPrior | None = None,
+        use_minmax_norm: bool = False,
     ) -> None:
         super().__init__()
-        self.thermal_prior = thermal_prior or ThermalSaliencyPrior()
-        self.saturation_uncertainty = saturation_uncertainty or VisibleSaturationUncertainty()
-        self.smoke_prior = smoke_prior or SmokeLowContrastPrior()
+        self.thermal_prior = thermal_prior or ThermalSaliencyPrior(
+            use_minmax_norm=use_minmax_norm
+        )
+        self.saturation_uncertainty = (
+            saturation_uncertainty
+            or VisibleSaturationUncertainty(use_minmax_norm=use_minmax_norm)
+        )
+        self.smoke_prior = smoke_prior or SmokeLowContrastPrior(
+            use_minmax_norm=use_minmax_norm
+        )
 
     def forward(self, ir: torch.Tensor, vis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         thermal_prior = self.thermal_prior(ir)
