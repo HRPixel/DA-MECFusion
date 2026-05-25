@@ -6,6 +6,14 @@ import argparse
 import random
 import shutil
 from pathlib import Path
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from datasets.sample_index import SampleRecord, write_manifest  # noqa: E402
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -124,24 +132,32 @@ def write_split(
     out_root: Path,
     split: str,
     copy_files: bool,
-) -> int:
+) -> tuple[int, list[SampleRecord]]:
     copied_labels = 0
+    manifest_records: list[SampleRecord] = []
     for sample in samples:
         name = str(sample["name"])
         ir_src = Path(sample["ir"])
         vis_src = Path(sample["vis"])
-        place_file(ir_src, out_root / split / "ir" / f"{name}{ir_src.suffix.lower()}", copy_files)
-        place_file(vis_src, out_root / split / "vis" / f"{name}{vis_src.suffix.lower()}", copy_files)
+        ir_dst = out_root / split / "ir" / f"{name}{ir_src.suffix.lower()}"
+        vis_dst = out_root / split / "vis" / f"{name}{vis_src.suffix.lower()}"
+        label_dst = None
+
+        place_file(ir_src, ir_dst, copy_files)
+        place_file(vis_src, vis_dst, copy_files)
 
         if "label" in sample:
             label_src = Path(sample["label"])
+            label_dst = out_root / split / "label" / f"{name}{label_src.suffix.lower()}"
             place_file(
                 label_src,
-                out_root / split / "label" / f"{name}{label_src.suffix.lower()}",
+                label_dst,
                 copy_files,
             )
             copied_labels += 1
-    return copied_labels
+
+        manifest_records.append(SampleRecord(name=name, ir=ir_dst, vis=vis_dst, label=label_dst))
+    return copied_labels, manifest_records
 
 
 def save_split_info(
@@ -154,6 +170,8 @@ def save_split_info(
     missing_label: list[str],
     copied_train_labels: int,
     copied_test_labels: int,
+    train_manifest: Path,
+    test_manifest: Path,
 ) -> None:
     lines = [
         "MSRS split information",
@@ -162,6 +180,8 @@ def save_split_info(
         f"test_count: {test_count}",
         f"train_labels_copied: {copied_train_labels}",
         f"test_labels_copied: {copied_test_labels}",
+        f"train_manifest: {train_manifest.as_posix()}",
+        f"test_manifest: {test_manifest.as_posix()}",
         f"missing_ir_count: {len(missing_ir)}",
         f"missing_vis_count: {len(missing_vis)}",
         f"missing_label_count: {len(missing_label)}",
@@ -208,8 +228,12 @@ def prepare_msrs(
     test_samples = samples[train_count:]
 
     ensure_output_dirs(out_root)
-    copied_train_labels = write_split(train_samples, out_root, "train", copy_files)
-    copied_test_labels = write_split(test_samples, out_root, "test", copy_files)
+    copied_train_labels, train_records = write_split(train_samples, out_root, "train", copy_files)
+    copied_test_labels, test_records = write_split(test_samples, out_root, "test", copy_files)
+    train_manifest = out_root / "splits" / "train.csv"
+    test_manifest = out_root / "splits" / "test.csv"
+    write_manifest(train_records, train_manifest, out_root)
+    write_manifest(test_records, test_manifest, out_root)
     save_split_info(
         out_root=out_root,
         total_count=len(samples),
@@ -220,6 +244,8 @@ def prepare_msrs(
         missing_label=missing_label,
         copied_train_labels=copied_train_labels,
         copied_test_labels=copied_test_labels,
+        train_manifest=train_manifest,
+        test_manifest=test_manifest,
     )
 
     print("MSRS preparation finished.")
@@ -231,6 +257,8 @@ def prepare_msrs(
     print(f"Missing IR files: {len(missing_ir)}")
     print(f"Missing VIS files: {len(missing_vis)}")
     print(f"Missing labels: {len(missing_label)}")
+    print(f"Train manifest: {train_manifest}")
+    print(f"Test manifest: {test_manifest}")
     print(f"Split info: {out_root / 'split_info.txt'}")
 
 
