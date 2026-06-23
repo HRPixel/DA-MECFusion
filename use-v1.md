@@ -1,14 +1,27 @@
-推荐使用方式
-先为已有 processed 数据生成清单：
+# DA-MECFusion v1-minimal usage
 
-python tools/build_manifest.py --data_root data/processed/MSRS --splits train test
-训练和测试命令可以保持原样，MSRSDataset 会自动读取 manifest：
+Current v1-minimal only supports the MSRS pipeline.
 
-python train.py --data_root data/processed/MSRS
-python test.py --data_root data/processed/MSRS --split test --checkpoint experiments/damecfusion_v1_msrs/checkpoints/best.pth
-评价阶段推荐新命令：
+Train:
 
-python eval.py --manifest data/processed/MSRS/splits/test.csv --fused_dir results/DA-MECFusion_V1/MSRS/fused --save_csv results/DA-MECFusion_V1/MSRS/metrics.csv --summary_txt results/DA-MECFusion_V1/MSRS/summary.txt
-旧命令仍兼容：
+```bash
+python train.py --data_root data/MSRS --run_root runs --run_name DA-MECFusion_v1_MSRS
+```
 
-python eval.py --ir_dir data/processed/MSRS/test/ir --vis_dir data/processed/MSRS/test/vis --fused_dir results/DA-MECFusion_V1/MSRS/fused
+Single-pair inference:
+
+```bash
+python infer.py --ir_path data/MSRS/test/ir/00001.png --vis_path data/MSRS/test/vis/00001.png --checkpoint runs/DA-MECFusion_v1_MSRS_YYYYMMDD_HHMMSS/checkpoints/best.pth
+```
+
+Batch test:
+
+```bash
+python test.py --data_root data/MSRS --checkpoint runs/DA-MECFusion_v1_MSRS_YYYYMMDD_HHMMSS/checkpoints/best.pth
+```
+
+Evaluate:
+
+```bash
+python eval.py --manifest data/MSRS/splits/test.csv --fused_dir runs/test_MSRS_YYYYMMDD_HHMMSS/outputs/fused
+```

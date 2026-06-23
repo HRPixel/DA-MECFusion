@@ -1,18 +1,13 @@
-"""Training script for DA-MECFusion V1 on MSRS."""
+"""Training script for DA-MECFusion V1-minimal on MSRS."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import random
 from pathlib import Path
 import sys
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -26,19 +21,30 @@ if str(PROJECT_ROOT) not in sys.path:
 from datasets.msrs_dataset import MSRSDataset  # noqa: E402
 from models.damecfusion import DAMECFusionV1  # noqa: E402
 from models.losses import DAMECFusionLoss  # noqa: E402
-from tools.visualize_priors import visualize_priors  # noqa: E402
-from tools.visualize_weights import visualize_mec_weights  # noqa: E402
+from utils import (  # noqa: E402
+    append_log,
+    create_run_dir,
+    get_names,
+    init_log,
+    move_batch_to_device,
+    prepare_run_dirs,
+    resolve_device,
+    save_fused_batch,
+    visualize_mec_weights,
+    visualize_priors,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DA-MECFusion V1 on MSRS.")
-    parser.add_argument("--data_root", type=str, default="data/processed/MSRS")
-    parser.add_argument("--save_dir", type=str, default="experiments/damecfusion_v1_msrs")
+    parser = argparse.ArgumentParser(description="Train DA-MECFusion V1-minimal on MSRS.")
+    parser.add_argument("--data_root", type=str, default="data/MSRS")
+    parser.add_argument("--run_root", type=str, default="runs")
+    parser.add_argument("--run_name", type=str, default="DA-MECFusion_v1_MSRS")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--height", type=int, default=256)
-    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_interval", type=int, default=5)
@@ -61,41 +67,6 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_device(requested_device: str) -> torch.device:
-    if requested_device.startswith("cuda") and not torch.cuda.is_available():
-        print(f"Requested device '{requested_device}' is unavailable. Falling back to cpu.")
-        return torch.device("cpu")
-    return torch.device(requested_device)
-
-
-def prepare_dirs(save_dir: Path) -> dict[str, Path]:
-    dirs = {
-        "root": save_dir,
-        "checkpoints": save_dir / "checkpoints",
-        "logs": save_dir / "logs",
-        "debug_outputs": save_dir / "debug_outputs",
-    }
-    for directory in dirs.values():
-        directory.mkdir(parents=True, exist_ok=True)
-    return dirs
-
-
-def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    moved: dict[str, Any] = {}
-    for key, value in batch.items():
-        moved[key] = value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-    return moved
-
-
-def get_names(batch: dict[str, Any], count: int) -> list[str]:
-    names = batch.get("name")
-    if names is None:
-        return [f"{index:03d}" for index in range(count)]
-    if isinstance(names, (list, tuple)):
-        return [str(name) for name in names[:count]]
-    return [str(names)]
-
-
 def save_checkpoint(
     path: Path,
     model: DAMECFusionV1,
@@ -111,31 +82,8 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
     }
+    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
-
-
-def normalize_image(image: np.ndarray) -> np.ndarray:
-    image = np.asarray(image, dtype=np.float32)
-    return np.clip(image, 0.0, 1.0)
-
-
-def sanitize_name(name: str) -> str:
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name)
-
-
-def save_fused_images(
-    fused: torch.Tensor,
-    names: list[str],
-    save_dir: Path,
-    max_images: int,
-) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    num_images = min(fused.shape[0], max_images)
-    fused_cpu = fused.detach().cpu()
-    for index in range(num_images):
-        name = sanitize_name(names[index] if index < len(names) else f"{index:03d}")
-        image = normalize_image(fused_cpu[index, 0].numpy())
-        plt.imsave(save_dir / f"fused_{name}.png", image, cmap="gray", vmin=0.0, vmax=1.0)
 
 
 def save_debug_outputs(
@@ -143,20 +91,19 @@ def save_debug_outputs(
     batch: dict[str, Any],
     device: torch.device,
     epoch: int,
-    debug_dir: Path,
+    dirs: dict[str, Path],
     max_images: int,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(batch, device)
     ir = batch["ir"]
     vis = batch["vis"]
-    names = get_names(batch, ir.shape[0])
-    epoch_dir = debug_dir / f"epoch_{epoch:03d}"
+    names = [f"epoch_{epoch:03d}_{name}" for name in get_names(batch, ir.shape[0])]
 
     with torch.no_grad():
         outputs = model(ir, vis)
 
-    save_fused_images(outputs["fused"], names, epoch_dir / "fused", max_images)
+    save_fused_batch(outputs["fused"], names, dirs["fused"], max_images=max_images)
     visualize_priors(
         outputs["thermal_prior"],
         outputs["sat_uncertainty"],
@@ -164,7 +111,8 @@ def save_debug_outputs(
         ir=ir,
         vis=vis,
         names=names,
-        save_dir=epoch_dir / "priors",
+        save_dir=dirs["priors"],
+        comparison_dir=dirs["prior_comparisons"],
         max_images=max_images,
     )
     visualize_mec_weights(
@@ -173,42 +121,11 @@ def save_debug_outputs(
         ir=ir,
         vis=vis,
         names=names,
-        save_dir=epoch_dir / "weights",
+        save_dir=dirs["weights"],
+        comparison_dir=dirs["weight_comparisons"],
         max_images=max_images,
     )
     model.train()
-
-
-def init_log(csv_path: Path) -> None:
-    with csv_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "epoch",
-                "loss_total",
-                "loss_int",
-                "loss_grad",
-                "loss_thermal",
-                "loss_sat",
-                "lr",
-            ]
-        )
-
-
-def append_log(csv_path: Path, epoch: int, averages: dict[str, float], lr: float) -> None:
-    with csv_path.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                epoch,
-                averages["loss_total"],
-                averages["loss_int"],
-                averages["loss_grad"],
-                averages["loss_thermal"],
-                averages["loss_sat"],
-                lr,
-            ]
-        )
 
 
 def train_one_epoch(
@@ -265,7 +182,8 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
-    dirs = prepare_dirs(Path(args.save_dir))
+    run_dir = create_run_dir(args.run_root, args.run_name)
+    dirs = prepare_run_dirs(run_dir)
     log_path = dirs["logs"] / "train_log.csv"
     init_log(log_path)
 
@@ -342,11 +260,12 @@ def main() -> None:
                 batch=debug_batch,
                 device=device,
                 epoch=epoch,
-                debug_dir=dirs["debug_outputs"],
+                dirs=dirs,
                 max_images=args.debug_samples,
             )
 
     print("Training finished.")
+    print(f"Run directory: {dirs['root']}")
     print(f"Latest checkpoint: {dirs['checkpoints'] / 'latest.pth'}")
     print(f"Best checkpoint: {dirs['checkpoints'] / 'best.pth'}")
     print(f"Training log: {log_path}")

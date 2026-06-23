@@ -15,14 +15,21 @@ env/
 # IDE and local tooling
 *.vsix
 
-# Data and generated artifacts
-data/raw/
-data/processed/
+# Data images and generated artifacts
+data/MSRS/train/
+data/MSRS/test/
+data/MSRS/splits/*.csv
+runs/
 debug_outputs/
 experiments/
 results/
 checkpoints/
 logs/
+
+# Legacy local data folders
+data/raw/
+data/processed/
+data/splits/
 
 # Model weights and arrays
 *.pth
