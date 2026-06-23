@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.transforms import pil_to_tensor, preprocess_pair  # noqa: E402
+from datasets.sample_index import read_manifest, resolve_manifest_path  # noqa: E402
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -47,6 +48,8 @@ class MSRSDataset(Dataset):
         height: int | None = None,
         width: int | None = None,
         use_label: bool = False,
+        manifest_path: str | None = None,
+        use_manifest: bool = True,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
@@ -54,6 +57,8 @@ class MSRSDataset(Dataset):
         self.height = height
         self.width = width
         self.use_label = use_label
+        self.manifest_path = Path(manifest_path) if manifest_path is not None else resolve_manifest_path(self.data_root, split)
+        self.use_manifest = use_manifest
 
         if (height is None) != (width is None):
             raise ValueError("height and width must be provided together")
@@ -62,6 +67,29 @@ class MSRSDataset(Dataset):
         self.ir_dir = split_root / "ir"
         self.vis_dir = split_root / "vis"
         self.label_dir = split_root / "label"
+
+        if self.use_manifest and self.manifest_path.is_file():
+            records = read_manifest(self.manifest_path, self.data_root)
+            self.samples = [
+                {
+                    "name": record.name,
+                    "ir_path": record.ir,
+                    "vis_path": record.vis,
+                    "label_path": record.label,
+                }
+                for record in records
+            ]
+            missing_files = [
+                str(path)
+                for sample in self.samples
+                for path in (sample["ir_path"], sample["vis_path"])
+                if path is not None and not Path(path).is_file()
+            ]
+            if missing_files:
+                raise FileNotFoundError(
+                    "Manifest contains missing image files: " + ", ".join(missing_files[:10])
+                )
+            return
 
         ir_files = _scan_images(self.ir_dir)
         vis_files = _scan_images(self.vis_dir)
@@ -83,6 +111,7 @@ class MSRSDataset(Dataset):
                 "name": stem,
                 "ir_path": ir_files[stem],
                 "vis_path": vis_files[stem],
+                "label_path": None,
             }
             for stem in sorted(ir_stems)
         ]
@@ -103,6 +132,9 @@ class MSRSDataset(Dataset):
                     f"Label directory not found: {self.label_dir}. Labels will be omitted.",
                     stacklevel=2,
                 )
+            for sample in self.samples:
+                if sample["name"] in self.label_files:
+                    sample["label_path"] = self.label_files[sample["name"]]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -123,11 +155,14 @@ class MSRSDataset(Dataset):
             "name": sample["name"],
         }
 
-        if self.use_label and sample["name"] in self.label_files:
-            label_img = Image.open(self.label_files[sample["name"]]).convert("L")
+        label_path = sample.get("label_path")
+        if self.use_label and label_path is not None:
+            label_img = Image.open(label_path).convert("L")
             if self.height is not None and self.width is not None:
                 label_img = label_img.resize((self.width, self.height), resample=Image.NEAREST)
             item["label"] = pil_to_tensor(label_img)
+        elif self.use_label:
+            warnings.warn(f"Label missing for sample '{sample['name']}'.", stacklevel=2)
 
         if ir.dim() != 3 or ir.size(0) != 1:
             raise ValueError(f"Invalid ir tensor shape for {sample['name']}: {tuple(ir.shape)}")
@@ -147,6 +182,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--use_label", action="store_true")
+    parser.add_argument("--manifest_path", type=str, default=None)
+    parser.add_argument("--no_manifest", action="store_true")
     return parser.parse_args()
 
 
@@ -166,6 +203,8 @@ if __name__ == "__main__":
         height=args.height,
         width=args.width,
         use_label=args.use_label,
+        manifest_path=args.manifest_path,
+        use_manifest=not args.no_manifest,
     )
     print(f"dataset length: {len(dataset)}")
 
