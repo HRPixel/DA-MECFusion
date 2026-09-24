@@ -171,12 +171,9 @@ def _to_batch_array(x: Any, channels: int | None = None) -> np.ndarray:
     return array
 
 
-def _normalize_0_1(image: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    image = np.asarray(image, dtype=np.float32)
-    min_value = float(np.nanmin(image))
-    max_value = float(np.nanmax(image))
-    image = (image - min_value) / (max_value - min_value + eps)
-    return np.clip(image, 0.0, 1.0)
+def _clip_0_1(image: np.ndarray) -> np.ndarray:
+    """Preserve absolute map values while making them image-safe."""
+    return np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
 
 
 def _name_for_index(names: Any, index: int) -> str:
@@ -192,23 +189,23 @@ def _name_for_index(names: Any, index: int) -> str:
 
 
 def _prepare_gray(batch: np.ndarray, index: int) -> np.ndarray:
-    return _normalize_0_1(batch[index, 0])
+    return _clip_0_1(batch[index, 0])
 
 
 def _prepare_visible(vis_batch: np.ndarray, index: int) -> np.ndarray:
     image = vis_batch[index]
     if image.shape[0] == 1:
-        return _normalize_0_1(image[0])
+        return _clip_0_1(image[0])
     if image.shape[0] == 3:
         image = np.transpose(image, (1, 2, 0))
-        return _normalize_0_1(image)
+        return _clip_0_1(image)
     raise ValueError(f"Visible image must have 1 or 3 channels, got {image.shape[0]}")
 
 
 def _save_gray(path: Path, image: np.ndarray) -> None:
     plt = _get_pyplot()
     path.parent.mkdir(parents=True, exist_ok=True)
-    plt.imsave(path, _normalize_0_1(image), cmap="gray", vmin=0.0, vmax=1.0)
+    plt.imsave(path, _clip_0_1(image), cmap="gray", vmin=0.0, vmax=1.0)
 
 
 def _save_prior_comparison(
@@ -388,3 +385,18 @@ def append_log(csv_path: str | Path, epoch: int, averages: dict[str, float], lr:
                 lr,
             ]
         )
+
+
+def _visualization_self_check() -> None:
+    w_ir = np.array([[[[0.25, 0.75, -1.0, 2.0]]]], dtype=np.float32)
+    w_vis = 1.0 - w_ir
+    ir_image = _prepare_gray(w_ir, 0)
+    vis_image = _prepare_gray(w_vis, 0)
+    assert np.allclose(ir_image, [[0.25, 0.75, 0.0, 1.0]])
+    assert np.allclose(vis_image, [[0.75, 0.25, 1.0, 0.0]])
+    assert np.allclose(ir_image + vis_image, 1.0)
+    print("Visualization absolute-scale self-check passed.")
+
+
+if __name__ == "__main__":
+    _visualization_self_check()

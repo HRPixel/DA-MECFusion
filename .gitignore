@@ -14,8 +14,24 @@ env/
 
 # IDE and local tooling
 *.vsix
+.vscode/
+.idea/
+AGENTS.md
+tools/build_v2_progress_docx.py
+.env
+.env.*
+!.env.example
 
 # Data images and generated artifacts
+data/**
+!data/**/
+!data/**/README.md
+*.zip
+*.7z
+*.tar
+*.gz
+*.h5
+*.safetensors
 data/MSRS/train/
 data/MSRS/test/
 data/MSRS/splits/*.csv

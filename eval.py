@@ -1,4 +1,4 @@
-"""Batch evaluation script for DA-MECFusion V1-minimal MSRS results."""
+"""Batch evaluation script for DA-MECFusion results."""
 
 from __future__ import annotations
 
@@ -22,11 +22,10 @@ from utils import create_run_dir, prepare_run_dirs  # noqa: E402
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-METRIC_KEYS = ("EN", "SD", "AG", "MI", "Qabf")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate DA-MECFusion V1-minimal MSRS results.")
+    parser = argparse.ArgumentParser(description="Evaluate DA-MECFusion fusion results.")
     parser.add_argument("--ir_dir", type=str, default=None)
     parser.add_argument("--vis_dir", type=str, default=None)
     parser.add_argument("--fused_dir", type=str, required=True)
@@ -37,6 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_csv", type=str, default=None)
     parser.add_argument("--summary_txt", type=str, default=None)
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument(
+        "--metric_profile",
+        choices=("legacy", "standard"),
+        default="legacy",
+        help=(
+            "legacy keeps the V1 Sobel-correlation Qabf approximation; "
+            "standard outputs SCD and Xydeas-Petrovic Qabf_standard."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -65,35 +73,51 @@ def read_gray_01(path: Path) -> np.ndarray:
     return np.clip(array, 0.0, 1.0)
 
 
-def write_csv(rows: list[dict[str, float | str]], save_csv: Path) -> None:
+def write_csv(
+    rows: list[dict[str, float | str]],
+    metric_keys: tuple[str, ...],
+    save_csv: Path,
+) -> None:
     save_csv.parent.mkdir(parents=True, exist_ok=True)
     with save_csv.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=("name", *METRIC_KEYS))
+        writer = csv.DictWriter(file, fieldnames=("name", *metric_keys))
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def compute_summary(rows: list[dict[str, float | str]]) -> dict[str, tuple[float, float]]:
+def compute_summary(
+    rows: list[dict[str, float | str]],
+    metric_keys: tuple[str, ...],
+) -> dict[str, tuple[float, float]]:
     summary: dict[str, tuple[float, float]] = {}
-    for key in METRIC_KEYS:
+    for key in metric_keys:
         values = np.asarray([float(row[key]) for row in rows], dtype=np.float64)
         summary[key] = (float(np.mean(values)), float(np.std(values)))
     return summary
 
 
-def write_summary(summary: dict[str, tuple[float, float]], summary_txt: Path, num_images: int) -> None:
+def write_summary(
+    summary: dict[str, tuple[float, float]],
+    metric_keys: tuple[str, ...],
+    summary_txt: Path,
+    num_images: int,
+) -> None:
     summary_txt.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"evaluated_images: {num_images}", ""]
-    for key in METRIC_KEYS:
+    for key in metric_keys:
         mean_value, std_value = summary[key]
         lines.append(f"{key}: mean={mean_value:.6f}, std={std_value:.6f}")
     summary_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def print_summary(summary: dict[str, tuple[float, float]], num_images: int) -> None:
+def print_summary(
+    summary: dict[str, tuple[float, float]],
+    metric_keys: tuple[str, ...],
+    num_images: int,
+) -> None:
     print(f"Evaluated images: {num_images}")
-    for key in METRIC_KEYS:
+    for key in metric_keys:
         mean_value, std_value = summary[key]
         print(f"{key}: mean={mean_value:.6f}, std={std_value:.6f}")
 
@@ -110,6 +134,7 @@ def evaluate_with_manifest(
     fused_dir: Path,
     save_csv: Path,
     summary_txt: Path,
+    metric_profile: str,
     recursive: bool = False,
 ) -> None:
     data_root = data_root or infer_data_root_from_manifest(manifest_path)
@@ -140,9 +165,9 @@ def evaluate_with_manifest(
             )
             continue
 
-        metrics = compute_all_metrics(ir, vis, fused)
+        metrics = compute_all_metrics(ir, vis, fused, profile=metric_profile)
         row: dict[str, float | str] = {"name": name}
-        row.update({key: float(metrics[key]) for key in METRIC_KEYS})
+        row.update(metrics)
         rows.append(row)
 
     finish_evaluation(rows, save_csv, summary_txt)
@@ -154,6 +179,7 @@ def evaluate(
     fused_dir: Path,
     save_csv: Path,
     summary_txt: Path,
+    metric_profile: str,
     recursive: bool = False,
 ) -> None:
     ir_files = scan_images(ir_dir, recursive=recursive)
@@ -180,9 +206,9 @@ def evaluate(
             )
             continue
 
-        metrics = compute_all_metrics(ir, vis, fused)
+        metrics = compute_all_metrics(ir, vis, fused, profile=metric_profile)
         row: dict[str, float | str] = {"name": name}
-        row.update({key: float(metrics[key]) for key in METRIC_KEYS})
+        row.update(metrics)
         rows.append(row)
 
     finish_evaluation(rows, save_csv, summary_txt)
@@ -195,10 +221,11 @@ def finish_evaluation(
 ) -> None:
     if not rows:
         raise RuntimeError("No valid IR/VIS/fused image triplets were evaluated.")
-    write_csv(rows, save_csv)
-    summary = compute_summary(rows)
-    write_summary(summary, summary_txt, len(rows))
-    print_summary(summary, len(rows))
+    metric_keys = tuple(key for key in rows[0] if key != "name")
+    write_csv(rows, metric_keys, save_csv)
+    summary = compute_summary(rows, metric_keys)
+    write_summary(summary, metric_keys, summary_txt, len(rows))
+    print_summary(summary, metric_keys, len(rows))
     print(f"Metrics CSV saved to: {save_csv}")
     print(f"Summary saved to: {summary_txt}")
 
@@ -217,6 +244,7 @@ def main() -> None:
             fused_dir=Path(args.fused_dir),
             save_csv=save_csv,
             summary_txt=summary_txt,
+            metric_profile=args.metric_profile,
             recursive=args.recursive,
         )
     else:
@@ -228,6 +256,7 @@ def main() -> None:
             fused_dir=Path(args.fused_dir),
             save_csv=save_csv,
             summary_txt=summary_txt,
+            metric_profile=args.metric_profile,
             recursive=args.recursive,
         )
 

@@ -36,12 +36,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--feature_channels", type=int, default=64)
+    parser.add_argument(
+        "--smoke_prior_mode",
+        choices=("base", "fixed_texture", "fixed_texture_luma"),
+        default=None,
+        help="Override the checkpoint smoke prior mode; old checkpoints default to base.",
+    )
+    parser.add_argument(
+        "--prior_residual_scale",
+        type=float,
+        default=None,
+        help="Override the checkpoint prior residual scale; old checkpoints default to 0.",
+    )
+    parser.add_argument(
+        "--bounded_learned_gap",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override bounded learned-gap mode; old checkpoints default to disabled.",
+    )
+    parser.add_argument(
+        "--equalize_feature_magnitude",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override fusion feature-magnitude equalization; old checkpoints default to disabled.",
+    )
     return parser.parse_args()
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> DAMECFusionV1:
-    model = DAMECFusionV1(feature_channels=args.feature_channels).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    smoke_prior_mode = args.smoke_prior_mode or checkpoint_args.get("smoke_prior_mode", "base")
+    prior_residual_scale = (
+        args.prior_residual_scale
+        if args.prior_residual_scale is not None
+        else float(checkpoint_args.get("prior_residual_scale", 0.0))
+    )
+    bounded_learned_gap = (
+        args.bounded_learned_gap
+        if args.bounded_learned_gap is not None
+        else bool(checkpoint_args.get("bounded_learned_gap", False))
+    )
+    equalize_feature_magnitude = (
+        args.equalize_feature_magnitude
+        if args.equalize_feature_magnitude is not None
+        else bool(checkpoint_args.get("equalize_feature_magnitude", False))
+    )
+    disable_thermal_prior = bool(checkpoint_args.get("disable_thermal_prior", False))
+    disable_sat_uncertainty = bool(checkpoint_args.get("disable_sat_uncertainty", False))
+    disable_smoke_prior = bool(checkpoint_args.get("disable_smoke_prior", False))
+    fixed_equal_weights = bool(checkpoint_args.get("fixed_equal_weights", False))
+    model = DAMECFusionV1(
+        feature_channels=args.feature_channels,
+        smoke_prior_mode=smoke_prior_mode,
+        prior_residual_scale=prior_residual_scale,
+        bounded_learned_gap=bounded_learned_gap,
+        equalize_feature_magnitude=equalize_feature_magnitude,
+        disable_thermal_prior=disable_thermal_prior,
+        disable_sat_uncertainty=disable_sat_uncertainty,
+        disable_smoke_prior=disable_smoke_prior,
+        fixed_equal_weights=fixed_equal_weights,
+    ).to(device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict)
     model.eval()
@@ -64,6 +119,14 @@ def main() -> None:
     vis = vis.unsqueeze(0).to(device)
 
     model = load_model(args, device)
+    print(f"Smoke prior mode: {model.prior_module.smoke_prior.mode}")
+    print(f"Prior residual scale: {model.mec.prior_residual_scale}")
+    print(f"Bounded learned gap: {model.mec.bounded_learned_gap}")
+    print(f"Equalize feature magnitude: {model.mec.equalize_feature_magnitude}")
+    print(f"Disable thermal prior to MEC: {model.mec.disable_thermal_prior}")
+    print(f"Disable saturation uncertainty to MEC: {model.mec.disable_sat_uncertainty}")
+    print(f"Disable smoke prior to MEC: {model.mec.disable_smoke_prior}")
+    print(f"Fixed equal weights: {model.mec.fixed_equal_weights}")
 
     with torch.no_grad():
         outputs = model(ir, vis)

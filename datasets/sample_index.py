@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 
@@ -124,7 +125,8 @@ def read_manifest(manifest_path: str | Path, data_root: str | Path) -> list[Samp
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     records: list[SampleRecord] = []
-    with manifest_path.open("r", newline="", encoding="utf-8") as file:
+    seen_names: set[str] = set()
+    with manifest_path.open("r", newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
         required = {"name", "ir", "vis"}
         missing_columns = required - set(reader.fieldnames or [])
@@ -132,12 +134,20 @@ def read_manifest(manifest_path: str | Path, data_root: str | Path) -> list[Samp
             raise ValueError(f"Manifest {manifest_path} is missing columns: {sorted(missing_columns)}")
 
         for row in reader:
+            name = row["name"].strip()
+            ir_value = row["ir"].strip()
+            vis_value = row["vis"].strip()
+            if not name or not ir_value or not vis_value:
+                raise ValueError(f"Manifest {manifest_path} contains a blank name/ir/vis field")
+            if name in seen_names:
+                raise ValueError(f"Manifest {manifest_path} contains duplicate name: {name}")
+            seen_names.add(name)
             label_value = (row.get("label") or "").strip()
             records.append(
                 SampleRecord(
-                    name=row["name"].strip(),
-                    ir=_resolve_record_path(row["ir"].strip(), data_root),
-                    vis=_resolve_record_path(row["vis"].strip(), data_root),
+                    name=name,
+                    ir=_resolve_record_path(ir_value, data_root),
+                    vis=_resolve_record_path(vis_value, data_root),
                     label=_resolve_record_path(label_value, data_root) if label_value else None,
                 )
             )
@@ -159,3 +169,15 @@ def build_split_manifest(
     label_dir = split_root / label_subdir
     label_files = scan_images(label_dir, recursive=recursive) if label_dir.is_dir() else None
     return pair_image_maps(ir_files, vis_files, label_files)
+
+
+if __name__ == "__main__":
+    content = "name,ir,vis,label\nsample,ir.png,vis.png,\n"
+    with TemporaryDirectory() as directory:
+        manifest = Path(directory) / "manifest.csv"
+        for encoding in ("utf-8", "utf-8-sig"):
+            manifest.write_text(content, encoding=encoding)
+            records = read_manifest(manifest, directory)
+            assert len(records) == 1
+            assert records[0].name == "sample"
+    print("sample_index self-check passed.")

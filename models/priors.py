@@ -50,8 +50,8 @@ def mean_filter(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
     )
 
 
-def sobel_gradient(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Compute Sobel gradient magnitude for a single-channel image tensor."""
+def sobel_components(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute horizontal and vertical Sobel gradients."""
     if x.dim() != 4 or x.size(1) != 1:
         raise ValueError(f"Expected x with shape [B,1,H,W], got {tuple(x.shape)}")
 
@@ -65,6 +65,12 @@ def sobel_gradient(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
     gx = F.conv2d(x_pad, kx, padding=0)
     gy = F.conv2d(x_pad, ky, padding=0)
+    return gx, gy
+
+
+def sobel_gradient(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Compute Sobel gradient magnitude for a single-channel image tensor."""
+    gx, gy = sobel_components(x)
     return torch.sqrt(gx * gx + gy * gy + eps)
 
 
@@ -190,6 +196,7 @@ class SmokeLowContrastPrior(nn.Module):
 
     def __init__(
         self,
+        mode: str = "base",
         window_size: int = 7,
         alpha_c: float = 0.5,
         beta_g: float = 0.5,
@@ -199,8 +206,19 @@ class SmokeLowContrastPrior(nn.Module):
         tau_d: float = 0.4,
         gamma_d: float = 0.1,
         use_minmax_norm: bool = False,
+        tau_contrast: float = 0.025,
+        gamma_contrast: float = 0.010,
+        tau_gradient: float = 0.100,
+        gamma_gradient: float = 0.040,
+        tau_luma: float = 0.450,
+        gamma_luma: float = 0.100,
     ) -> None:
         super().__init__()
+        if mode not in {"base", "fixed_texture", "fixed_texture_luma"}:
+            raise ValueError(f"Unsupported smoke prior mode: {mode}")
+        if min(gamma_contrast, gamma_gradient, gamma_luma) <= 0:
+            raise ValueError("Smoke prior gamma values must be positive")
+        self.mode = mode
         self.window_size = window_size
         self.alpha_c = alpha_c
         self.beta_g = beta_g
@@ -210,6 +228,12 @@ class SmokeLowContrastPrior(nn.Module):
         self.tau_d = tau_d
         self.gamma_d = gamma_d
         self.use_minmax_norm = use_minmax_norm
+        self.tau_contrast = tau_contrast
+        self.gamma_contrast = gamma_contrast
+        self.tau_gradient = tau_gradient
+        self.gamma_gradient = gamma_gradient
+        self.tau_luma = tau_luma
+        self.gamma_luma = gamma_luma
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         if vis.dim() != 4 or vis.size(1) != 3:
@@ -220,15 +244,27 @@ class SmokeLowContrastPrior(nn.Module):
         local_mean_sq = mean_filter(vis_y * vis_y, self.window_size)
         local_var = torch.clamp(local_mean_sq - local_mean * local_mean, min=0.0)
         local_std = torch.sqrt(local_var + self.eps)
+        gradient = sobel_gradient(vis_y, self.eps)
 
-        contrast_norm = normalize_0_1(local_std, self.eps)
-        grad_norm = normalize_0_1(sobel_gradient(vis_y, self.eps), self.eps)
-        reliability = self.alpha_c * contrast_norm + self.beta_g * grad_norm
-
-        if self.use_sigmoid:
-            d_smoke = torch.sigmoid((self.tau_d - reliability) / self.gamma_d)
+        if self.mode == "base":
+            contrast_norm = normalize_0_1(local_std, self.eps)
+            grad_norm = normalize_0_1(gradient, self.eps)
+            reliability = self.alpha_c * contrast_norm + self.beta_g * grad_norm
+            if self.use_sigmoid:
+                d_smoke = torch.sigmoid((self.tau_d - reliability) / self.gamma_d)
+            else:
+                d_smoke = 1.0 - reliability
         else:
-            d_smoke = 1.0 - reliability
+            low_contrast = torch.sigmoid(
+                (self.tau_contrast - local_std) / self.gamma_contrast
+            )
+            low_gradient = torch.sigmoid(
+                (self.tau_gradient - gradient) / self.gamma_gradient
+            )
+            d_smoke = low_contrast * low_gradient
+            if self.mode == "fixed_texture_luma":
+                luma_gate = torch.sigmoid((vis_y - self.tau_luma) / self.gamma_luma)
+                d_smoke = d_smoke * luma_gate
 
         if self.smooth:
             d_smoke = mean_filter(d_smoke, 3)
@@ -248,6 +284,7 @@ class RuleBasedPriorModule(nn.Module):
         saturation_uncertainty: VisibleSaturationUncertainty | None = None,
         smoke_prior: SmokeLowContrastPrior | None = None,
         use_minmax_norm: bool = False,
+        smoke_prior_mode: str = "base",
     ) -> None:
         super().__init__()
         self.thermal_prior = thermal_prior or ThermalSaliencyPrior(
@@ -258,7 +295,8 @@ class RuleBasedPriorModule(nn.Module):
             or VisibleSaturationUncertainty(use_minmax_norm=use_minmax_norm)
         )
         self.smoke_prior = smoke_prior or SmokeLowContrastPrior(
-            use_minmax_norm=use_minmax_norm
+            mode=smoke_prior_mode,
+            use_minmax_norm=use_minmax_norm,
         )
 
     def forward(self, ir: torch.Tensor, vis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -293,5 +331,20 @@ if __name__ == "__main__":
         assert not torch.isnan(prior).any(), prior_name
         assert prior.min().item() >= 0.0, prior_name
         assert prior.max().item() <= 1.0, prior_name
+
+    bright_flat = torch.full((1, 3, 8, 8), 0.7)
+    dark_flat = torch.full((1, 3, 8, 8), 0.1)
+    torch.manual_seed(0)
+    textured = torch.rand(1, 3, 8, 8)
+    for mode in ("base", "fixed_texture", "fixed_texture_luma"):
+        prior = SmokeLowContrastPrior(mode=mode)
+        bright = prior(bright_flat)
+        assert bright.shape == (1, 1, 8, 8), mode
+        assert bright.min().item() >= 0.0, mode
+        assert bright.max().item() <= 1.0, mode
+        if mode == "fixed_texture":
+            assert bright.mean() > prior(textured).mean(), mode
+        elif mode == "fixed_texture_luma":
+            assert bright.mean() > prior(dark_flat).mean(), mode
 
     print("RuleBasedPriorModule self-test passed.")

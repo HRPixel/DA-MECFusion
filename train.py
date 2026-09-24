@@ -1,8 +1,9 @@
-"""Training script for DA-MECFusion V1-minimal on MSRS."""
+"""Training script for DA-MECFusion paired infrared-visible manifests."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 import sys
@@ -36,9 +37,11 @@ from utils import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DA-MECFusion V1-minimal on MSRS.")
-    parser.add_argument("--data_root", type=str, default="data/MSRS")
-    parser.add_argument("--run_root", type=str, default="runs")
+    parser = argparse.ArgumentParser(description="Train DA-MECFusion on a paired IR/VIS manifest.")
+    parser.add_argument("--data_root", type=str, default="./data/MSRS")
+    parser.add_argument("--train_manifest", type=str, default=None)
+    parser.add_argument("--val_manifest", type=str, default=None)
+    parser.add_argument("--run_root", type=str, default="./runs")
     parser.add_argument("--run_name", type=str, default="DA-MECFusion_v1_MSRS")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -54,11 +57,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_grad", type=float, default=10.0)
     parser.add_argument("--lambda_thermal", type=float, default=1.0)
     parser.add_argument("--lambda_sat", type=float, default=0.5)
+    parser.add_argument(
+        "--gradient_mode",
+        choices=("magnitude", "directional"),
+        default="magnitude",
+        help="Use directional with --lambda_grad 2 for V2-Base; magnitude preserves V1 behavior.",
+    )
+    parser.add_argument(
+        "--intensity_target",
+        choices=("max", "mec_weighted"),
+        default="max",
+        help="Use detached MEC-weighted IR/VIS-Y intensity for V2-Loss-1; max preserves prior behavior.",
+    )
+    parser.add_argument(
+        "--smoke_prior_mode",
+        choices=("base", "fixed_texture", "fixed_texture_luma"),
+        default="base",
+        help="Smoke prior formula; base preserves V1 behavior.",
+    )
+    parser.add_argument(
+        "--prior_residual_scale",
+        type=float,
+        default=0.0,
+        help="Centered prior logit residual scale; 0 preserves V1 behavior.",
+    )
+    parser.add_argument(
+        "--bounded_learned_gap",
+        action="store_true",
+        help="Bound the learned IR-VIS logit gap to (-2, 2) before adding the prior residual.",
+    )
+    parser.add_argument(
+        "--equalize_feature_magnitude",
+        action="store_true",
+        help="Equalize per-pixel IR/VIS channel-mean absolute magnitude only for final fusion.",
+    )
+    parser.add_argument(
+        "--disable_thermal_prior",
+        action="store_true",
+        help="Ablation: stop thermal prior from entering MEC; raw prior and losses stay unchanged.",
+    )
+    parser.add_argument(
+        "--disable_sat_uncertainty",
+        action="store_true",
+        help="Ablation: stop saturation uncertainty from entering MEC; raw prior and losses stay unchanged.",
+    )
+    parser.add_argument(
+        "--disable_smoke_prior",
+        action="store_true",
+        help="Ablation: stop smoke prior from entering MEC; raw prior stays available for diagnosis.",
+    )
+    parser.add_argument(
+        "--fixed_equal_weights",
+        action="store_true",
+        help="Ablation: use fixed w_ir=w_vis=0.5 during training and inference.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overfit_batches", type=int, default=0)
     return parser.parse_args()
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -160,8 +215,8 @@ def train_one_epoch(
         outputs = model(ir, vis)
         loss_total, loss_dict = criterion(outputs, ir, vis)
 
-        if torch.isnan(loss_total):
-            raise FloatingPointError(f"NaN loss detected at epoch {epoch}, step {step}")
+        if not torch.isfinite(loss_total):
+            raise FloatingPointError(f"Non-finite loss detected at epoch {epoch}, step {step}")
 
         loss_total.backward()
         optimizer.step()
@@ -178,6 +233,38 @@ def train_one_epoch(
     return {key: value / num_steps for key, value in totals.items()}
 
 
+def validate_one_epoch(
+    model: DAMECFusionV1,
+    criterion: DAMECFusionLoss,
+    loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+) -> dict[str, float]:
+    model.eval()
+    totals = {
+        "loss_total": 0.0,
+        "loss_int": 0.0,
+        "loss_grad": 0.0,
+        "loss_thermal": 0.0,
+        "loss_sat": 0.0,
+    }
+    num_steps = 0
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f"Validation {epoch}", leave=False):
+            batch = move_batch_to_device(batch, device)
+            outputs = model(batch["ir"], batch["vis"])
+            loss_total, loss_dict = criterion(outputs, batch["ir"], batch["vis"])
+            if not torch.isfinite(loss_total):
+                raise FloatingPointError(f"Non-finite validation loss at epoch {epoch}")
+            for key in totals:
+                totals[key] += float(loss_dict[key].cpu().item())
+            num_steps += 1
+
+    if num_steps == 0:
+        raise RuntimeError("Validation dataset is empty")
+    return {key: value / num_steps for key, value in totals.items()}
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -185,6 +272,7 @@ def main() -> None:
     run_dir = create_run_dir(args.run_root, args.run_name)
     dirs = prepare_run_dirs(run_dir)
     log_path = dirs["logs"] / "train_log.csv"
+    val_log_path = dirs["logs"] / "val_log.csv"
     init_log(log_path)
 
     dataset = MSRSDataset(
@@ -193,6 +281,7 @@ def main() -> None:
         height=args.height,
         width=args.width,
         use_label=False,
+        manifest_path=args.train_manifest,
     )
     if len(dataset) == 0:
         raise RuntimeError(f"Training dataset is empty: {args.data_root}")
@@ -207,12 +296,58 @@ def main() -> None:
     )
     debug_batch = next(iter(loader))
 
-    model = DAMECFusionV1(feature_channels=args.feature_channels).to(device)
+    val_loader = None
+    val_dataset = None
+    if args.val_manifest is not None:
+        val_dataset = MSRSDataset(
+            data_root=args.data_root,
+            split="val",
+            height=args.height,
+            width=args.width,
+            use_label=False,
+            manifest_path=args.val_manifest,
+        )
+        if len(val_dataset) == 0:
+            raise RuntimeError(f"Validation dataset is empty: {args.val_manifest}")
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+        )
+        init_log(val_log_path)
+
+    run_metadata = {
+        "command": [sys.executable, *sys.argv],
+        "args": vars(args),
+        "train_samples": len(dataset),
+        "val_samples": len(val_dataset) if val_dataset is not None else 0,
+    }
+    (dirs["root"] / "run_config.json").write_text(
+        json.dumps(run_metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    model = DAMECFusionV1(
+        feature_channels=args.feature_channels,
+        smoke_prior_mode=args.smoke_prior_mode,
+        prior_residual_scale=args.prior_residual_scale,
+        bounded_learned_gap=args.bounded_learned_gap,
+        equalize_feature_magnitude=args.equalize_feature_magnitude,
+        disable_thermal_prior=args.disable_thermal_prior,
+        disable_sat_uncertainty=args.disable_sat_uncertainty,
+        disable_smoke_prior=args.disable_smoke_prior,
+        fixed_equal_weights=args.fixed_equal_weights,
+    ).to(device)
     criterion = DAMECFusionLoss(
         lambda_int=args.lambda_int,
         lambda_grad=args.lambda_grad,
         lambda_thermal=args.lambda_thermal,
         lambda_sat=args.lambda_sat,
+        gradient_mode=args.gradient_mode,
+        intensity_target=args.intensity_target,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -239,11 +374,21 @@ def main() -> None:
             f"loss_sat={averages['loss_sat']:.6f}"
         )
 
-        latest_path = dirs["checkpoints"] / "latest.pth"
-        save_checkpoint(latest_path, model, optimizer, epoch, averages["loss_total"], args)
+        val_averages = None
+        if val_loader is not None:
+            val_averages = validate_one_epoch(model, criterion, val_loader, device, epoch)
+            append_log(val_log_path, epoch, val_averages, current_lr)
+            print(f"Validation {epoch}/{args.epochs} loss_total={val_averages['loss_total']:.6f}")
 
-        if averages["loss_total"] < best_loss:
-            best_loss = averages["loss_total"]
+        selection_loss = (
+            val_averages["loss_total"] if val_averages is not None else averages["loss_total"]
+        )
+
+        latest_path = dirs["checkpoints"] / "latest.pth"
+        save_checkpoint(latest_path, model, optimizer, epoch, selection_loss, args)
+
+        if selection_loss < best_loss:
+            best_loss = selection_loss
             save_checkpoint(dirs["checkpoints"] / "best.pth", model, optimizer, epoch, best_loss, args)
 
         if args.save_interval > 0 and epoch % args.save_interval == 0:
@@ -252,7 +397,7 @@ def main() -> None:
                 model,
                 optimizer,
                 epoch,
-                averages["loss_total"],
+                selection_loss,
                 args,
             )
             save_debug_outputs(
@@ -269,6 +414,8 @@ def main() -> None:
     print(f"Latest checkpoint: {dirs['checkpoints'] / 'latest.pth'}")
     print(f"Best checkpoint: {dirs['checkpoints'] / 'best.pth'}")
     print(f"Training log: {log_path}")
+    if val_loader is not None:
+        print(f"Validation log: {val_log_path}")
 
 
 if __name__ == "__main__":

@@ -68,6 +68,9 @@ class MSRSDataset(Dataset):
         self.vis_dir = split_root / "vis"
         self.label_dir = split_root / "label"
 
+        if manifest_path is not None and not self.manifest_path.is_file():
+            raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
+
         if self.use_manifest and self.manifest_path.is_file():
             records = read_manifest(self.manifest_path, self.data_root)
             self.samples = [

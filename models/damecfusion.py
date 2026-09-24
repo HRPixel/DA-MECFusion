@@ -1,4 +1,4 @@
-"""DA-MECFusion V1 main model assembly."""
+"""V1-compatible DA-MECFusion model assembly shared by V2 experiments."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from models.priors import RuleBasedPriorModule, rgb_to_y  # noqa: E402
 
 
 class DAMECFusionV1(nn.Module):
-    """Minimal DA-MECFusion V1 forward pipeline."""
+    """Minimal V1-compatible forward pipeline with explicit V2 prior selection."""
 
     def __init__(
         self,
@@ -29,6 +29,14 @@ class DAMECFusionV1(nn.Module):
         encoder_blocks: int = 2,
         decoder_blocks: int = 2,
         use_bn: bool = False,
+        smoke_prior_mode: str = "base",
+        prior_residual_scale: float = 0.0,
+        bounded_learned_gap: bool = False,
+        equalize_feature_magnitude: bool = False,
+        disable_thermal_prior: bool = False,
+        disable_sat_uncertainty: bool = False,
+        disable_smoke_prior: bool = False,
+        fixed_equal_weights: bool = False,
     ) -> None:
         super().__init__()
         if feature_channels <= 0:
@@ -36,7 +44,7 @@ class DAMECFusionV1(nn.Module):
         if hidden_channels <= 0:
             raise ValueError("hidden_channels must be positive")
 
-        self.prior_module = RuleBasedPriorModule()
+        self.prior_module = RuleBasedPriorModule(smoke_prior_mode=smoke_prior_mode)
         self.ir_encoder = SimpleEncoder(
             in_channels=1,
             out_channels=feature_channels,
@@ -55,6 +63,13 @@ class DAMECFusionV1(nn.Module):
             feature_channels=feature_channels,
             hidden_channels=hidden_channels,
             use_bn=use_bn,
+            prior_residual_scale=prior_residual_scale,
+            bounded_learned_gap=bounded_learned_gap,
+            equalize_feature_magnitude=equalize_feature_magnitude,
+            disable_thermal_prior=disable_thermal_prior,
+            disable_sat_uncertainty=disable_sat_uncertainty,
+            disable_smoke_prior=disable_smoke_prior,
+            fixed_equal_weights=fixed_equal_weights,
         )
         self.decoder = FusionDecoder(
             in_channels=feature_channels,
@@ -108,7 +123,7 @@ def _print_output_stats(name: str, x: torch.Tensor) -> None:
 if __name__ == "__main__":
     ir = torch.rand(2, 1, 256, 256)
     vis = torch.rand(2, 3, 256, 256)
-    model = DAMECFusionV1(feature_channels=64)
+    model = DAMECFusionV1(feature_channels=64, prior_residual_scale=1.0)
 
     outputs = model(ir, vis)
     for key, value in outputs.items():
